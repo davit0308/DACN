@@ -6,6 +6,12 @@ Anonymous author
 import numpy as np
 import networkx as nx
 
+# NetworkX 3.0 removed from_numpy_matrix; the replacement is from_numpy_array.
+# This shim makes the code work on both old and new NetworkX versions.
+if not hasattr(nx, 'from_numpy_matrix'):
+    nx.from_numpy_matrix = nx.from_numpy_array
+
+
 import torch
 from torch.utils.data import Dataset
 from logmaking import make_print_to_file

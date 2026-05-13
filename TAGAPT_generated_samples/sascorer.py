@@ -3,7 +3,12 @@ from __future__ import print_function
 from rdkit import Chem
 from rdkit.Chem import rdMolDescriptors
 import pickle as cPickle
-from rdkit.six import iteritems
+
+# rdkit.six was removed in RDKit >= 2022; iteritems() == dict.items() in Python 3
+try:
+    from rdkit.six import iteritems
+except ImportError:
+    iteritems = lambda d: d.items()
 
 import math
 

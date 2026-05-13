@@ -142,6 +142,25 @@ EXECUTABLE_EXTENSIONS = frozenset({
     ".jar",
 })
 
+# Executable extensions that are EXPLICIT (non-empty).
+# Used when validating named EX targets — no-extension is ambiguous
+# (could be Linux binary OR system config file like 'crontab', 'passwd').
+EXECUTABLE_EXTENSIONS_STRICT = EXECUTABLE_EXTENSIONS - {""}
+
+# ── ALLOWLIST 4: Tools that do BOTH network I/O AND file write ──
+# Prefer these when a node has both ST/RF and WR edges.
+FILE_AND_NETWORK_TOOLS = frozenset({
+    "curl", "wget", "scp", "sftp", "ssh", "nc", "ncat", "socat",
+    "ftp", "lftp", "rsync", "axel",
+    "bash", "sh", "python", "python3", "perl", "ruby",
+})
+
+# ── ALLOWLIST 5: Pure-scanner tools — only meaningful for ST/RF, NOT WR ──
+SCANNER_ONLY_TOOLS = frozenset({
+    "nmap", "masscan", "nikto", "dirb", "gobuster", "zmap",
+    "unicornscan", "arp-scan", "cewl",
+})
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FALLBACK INSTANCES
@@ -239,8 +258,13 @@ class EdgeConstraintValidator:
         if verb == "EX":
             if actual_tool and actual_tool not in SHELL_AND_EXECUTORS:
                 return False
-            if actual_ext and actual_ext not in EXECUTABLE_EXTENSIONS:
-                return False
+            # When the target is a *named* file (not a placeholder), require an
+            # explicit executable extension.  No-extension ("") is too ambiguous:
+            # it covers both real Linux binaries AND system-config files like
+            # 'crontab' or 'passwd' which are NOT valid EX targets in APT context.
+            if target_name and target_name not in ("", "unknown"):
+                if actual_ext not in EXECUTABLE_EXTENSIONS_STRICT:
+                    return False
 
         # ── ST / RF: Only network-capable tools ──
         if verb in ("ST", "RF"):

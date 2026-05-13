@@ -1,5 +1,26 @@
-numpy>=1.19.0
+# TAGAPT Generated Samples - Full dependency list
+# Install on Kaggle with:
+#   !pip install -r requirements.txt
+#
+# NOTE: torch and rdkit are pre-installed on Kaggle GPU kernels.
+# Only install what's missing.
+
+# ── Core ML ────────────────────────────────────────────────────────────────
+torch>=1.9.0           # pre-installed on Kaggle GPU
+numpy>=1.19.0          # pre-installed on Kaggle
+
+# ── Chemistry (RDKit) ──────────────────────────────────────────────────────
+# On Kaggle: rdkit is pre-installed. If not:
+#   !pip install rdkit
+# NOTE: rdkit.six was removed in rdkit>=2022. sascorer.py is already patched.
+
+# ── Graph / Visualization ──────────────────────────────────────────────────
 networkx>=2.5
-torch>=1.9.0
-rdkit>=2021.03.1
 graphviz>=0.16
+
+# ── NOT needed via pip (local files in this directory) ─────────────────────
+# logmaking.py    <- recreated locally, no pip install needed
+# sascorer.py     <- local file
+# environment.py  <- local file
+# pruning_agent.py <- local file
+# edge_validator.py <- local file

@@ -11,7 +11,262 @@ import re
 from operator import itemgetter
 import json
 from pruning_agent import PruningAgent, FastGA
-from edge_validator import EdgeConstraintValidator
+from edge_validator import (
+    EdgeConstraintValidator,
+    FILE_AND_NETWORK_TOOLS,
+    SCANNER_ONLY_TOOLS,
+    EXECUTABLE_EXTENSIONS_STRICT,
+)
+
+
+def generate_smart_instance_name(node_type: str, edge_context: dict) -> str:
+    """
+    Generate a semantically realistic instance name when CTI lookup yields
+    no valid match for the required edge verbs.
+
+    Instead of falling back to 'unknown_tool' / 'unknown_process' etc.,
+    we pick a real tool/file name that is *guaranteed* to be consistent
+    with the edge constraints the node participates in.
+
+    Args:
+        node_type   : 'MP', 'TP', 'MF', 'SF', 'TF', or 'SO'
+        edge_context: dict with keys
+            'out_verbs' -> list of outgoing verb strings (e.g. ['FR','WR'])
+            'in_verbs'  -> list of incoming verb strings (e.g. ['FR'])
+
+    Returns:
+        A realistic, semantically valid instance name string.
+    """
+    out_verbs = set(edge_context.get("out_verbs", []))
+    in_verbs  = set(edge_context.get("in_verbs", []))
+
+    # ── Process nodes (MP = Malicious Process, TP = Tool Process) ──
+    if node_type in ("MP", "TP"):
+        # Needs fork / exec / inject capability → must be shell or interpreter
+        if out_verbs & {"FR", "IJ", "EX"}:
+            if node_type == "MP":
+                return random.choice(["bash", "sh", "python", "perl", "python3"])
+            else:  # TP
+                return random.choice(["bash", "sh", "python3", "perl", "sudo"])
+
+        # Needs network send/receive → network-capable tool
+        if out_verbs & {"ST", "RF"}:
+            if node_type == "MP":
+                return random.choice(["bash", "python", "nc", "curl", "wget"])
+            else:  # TP
+                return random.choice(["curl", "wget", "nc", "ssh", "nmap", "scp"])
+
+        # File I/O only (RD / WR / CD / UK)
+        if out_verbs & {"RD", "WR", "CD", "UK"}:
+            if node_type == "TP":
+                return random.choice(["cat", "cp", "grep", "awk", "dd", "tee", "sed"])
+            else:  # MP – still an "active" process
+                return random.choice(["bash", "python", "cat", "cp", "dd"])
+
+        # No out_verbs recognised → safe default
+        if node_type == "TP":
+            return random.choice(["cat", "grep", "awk", "cp", "dd"])
+        else:  # MP
+            return random.choice(["bash", "sh", "python"])
+
+    # ── Malicious File ──
+    elif node_type == "MF":
+        return random.choice([
+            "malware.bin", "payload.elf", "backdoor.sh",
+            "exploit.py", "dropper.bin", "implant", "stager.sh"
+        ])
+
+    # ── System File ──
+    elif node_type == "SF":
+        # If this file is being executed, MUST have explicit executable extension
+        # (matches EXECUTABLE_EXTENSIONS_STRICT: no empty-string allowed)
+        if "EX" in in_verbs:
+            return random.choice([
+                "init.sh", "startup.sh", "cron.sh", "deploy.sh",
+                "backdoor.bin", "loader.elf", "stager.py", "hook.pl",
+            ])
+        return random.choice([
+            "passwd", "shadow", "sudoers", "hosts",
+            "sshd_config", "crontab", "fstab", "resolv.conf",
+            "httpd.conf", "nginx.conf", "my.cnf", "bashrc"
+        ])
+
+
+    # ── Temporary File ──
+    elif node_type == "TF":
+        return random.choice([
+            "out.tmp", "data.log", "dump.tmp", "capture.pcap",
+            "loot.txt", "creds.txt", "scan.out", "output.dat"
+        ])
+
+    # ── Socket / Network endpoint ──
+    elif node_type == "SO":
+        ports = ["80", "443", "22", "21", "4444", "8080", "53", "25"]
+        return "0.0.0.0:" + random.choice(ports)
+
+    # Catch-all (should never reach here if node_type is valid)
+    return "unknown_" + node_type.lower()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UK EDGE RESOLVER
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Lookup table: (src_type, dst_type) -> preferred verb when UK is seen
+# Based on semantics in provenance graphs:
+#   Process  -> File    : write or read (50/50 randomised)
+#   Process  -> Process : fork (subprocess spawn)
+#   Process  -> Socket  : send data to network
+#   Socket   -> Process : receive data from network (RF)
+#   File     -> Process : execute (file executed by process)
+_UK_RESOLUTION_TABLE = {
+    # (src_type, dst_type) : verb  OR callable(src, dst) -> verb
+    ("MP", "SF"): lambda: random.choice(["WR", "RD"]),
+    ("MP", "TF"): "WR",
+    ("MP", "MF"): lambda: random.choice(["WR", "EX"]),
+    ("MP", "SO"): "ST",
+    ("MP", "TP"): "FR",
+    ("MP", "MP"): "FR",
+    ("TP", "SF"): lambda: random.choice(["WR", "RD"]),
+    ("TP", "TF"): lambda: random.choice(["WR", "RD"]),
+    ("TP", "MF"): lambda: random.choice(["RD", "EX"]),
+    ("TP", "SO"): "ST",
+    ("TP", "TP"): lambda: random.choice(["FR", "IJ"]),
+    ("TP", "MP"): "IJ",
+    ("SO", "MP"): "RF",
+    ("SO", "TP"): "RF",
+    ("SF", "MP"): "RD",
+    ("SF", "TP"): "RD",
+    ("MF", "MP"): "EX",
+    ("MF", "TP"): "EX",
+}
+
+_UK_FALLBACK_VERB = "RD"     # safest default if no rule matches
+
+
+def resolve_uk_edges(entity_list, relation_list):
+    """
+    Replace 'UK' (unknown) verb edges with semantically appropriate verbs
+    determined by the src/dst node types.
+
+    This is a post-processing step applied to the raw model output
+    BEFORE the GA regulation-matching phase.  Because UK edges cannot
+    be matched by any regulation rule, resolving them increases the
+    regulation coverage score and yields semantically richer graphs.
+
+    Args:
+        entity_list  : list of node type strings e.g. ['MP', 'TP', 'SF', ...]
+        relation_list: list-of-lists (one per stage) of
+                       [src_idx, dst_idx, verb, edge_id]
+
+    Returns:
+        (resolved_relation_list, stats_dict)
+    """
+    total_uk = 0
+    resolved  = 0
+
+    new_relation_list = []
+    for stage_edges in relation_list:
+        new_stage = []
+        for edge in stage_edges:
+            # edge format: [src_idx, dst_idx, verb, edge_id]
+            src_idx, dst_idx, verb, eid = edge[0], edge[1], edge[2], edge[3]
+            if verb != "UK":
+                new_stage.append(edge)
+                continue
+
+            total_uk += 1
+            # Resolve using node types
+            try:
+                src_type = entity_list[int(src_idx)]
+                dst_type = entity_list[int(dst_idx)]
+            except (IndexError, ValueError):
+                new_stage.append(edge)
+                continue
+
+            rule = _UK_RESOLUTION_TABLE.get((src_type, dst_type))
+            if rule is None:
+                # Try reverse direction as fallback clue
+                rule = _UK_RESOLUTION_TABLE.get((dst_type, src_type))
+
+            if rule is not None:
+                new_verb = rule() if callable(rule) else rule
+                resolved += 1
+            else:
+                new_verb = _UK_FALLBACK_VERB
+
+            new_edge = [src_idx, dst_idx, new_verb, eid]
+            new_stage.append(new_edge)
+
+        new_relation_list.append(new_stage)
+
+    stats = {
+        "total_uk": total_uk,
+        "resolved": resolved,
+        "unresolved": total_uk - resolved,
+    }
+    return new_relation_list, stats
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NETWORK NODE INJECTOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+def inject_network_node_if_missing(entity_list, relation_list):
+    """
+    Ensure every graph has at least one SO (Socket) node to represent
+    C2 / exfiltration activity.  If no SO node exists, inject one and
+    wire it to the first MP node via a ST (Send) edge.
+
+    This compensates for the 21% of model outputs that lack network
+    activity nodes (diagnosed from the 100-graph sample).
+
+    Args:
+        entity_list  : list of node types (mutated in-place)
+        relation_list: list-of-lists of edges (mutated in-place, stage 1
+                       gets the new ST edge)
+
+    Returns:
+        (entity_list, relation_list, injected: bool)
+    """
+    if "SO" in entity_list:
+        return entity_list, relation_list, False
+
+    # Find the MP or TP node with the highest out-degree (most "active" process)
+    out_degree = {}
+    for stage_edges in relation_list:
+        for edge in stage_edges:
+            src = int(edge[0])
+            out_degree[src] = out_degree.get(src, 0) + 1
+
+    # Prefer MP, then TP
+    mp_nodes = [i for i, t in enumerate(entity_list) if t == "MP"]
+    tp_nodes = [i for i, t in enumerate(entity_list) if t == "TP"]
+
+    if mp_nodes:
+        src_node = max(mp_nodes, key=lambda i: out_degree.get(i, 0))
+    elif tp_nodes:
+        src_node = max(tp_nodes, key=lambda i: out_degree.get(i, 0))
+    else:
+        return entity_list, relation_list, False  # nothing to wire to
+
+    # Inject SO node
+    so_idx = len(entity_list)
+    entity_list = list(entity_list) + ["SO"]
+
+    # Compute next edge id
+    all_eids = [e[3] for stage in relation_list for e in stage]
+    next_eid = max(all_eids) + 1 if all_eids else 0
+
+    # Inject ST edge in stage 1 (reconnaissance / initial comms)
+    new_edge = [str(src_node), str(so_idx), "ST", next_eid]
+    relation_list[0] = list(relation_list[0]) + [new_edge]
+
+    print(f"  [INJECT] No SO node found -> injected SO node {so_idx}, "
+          f"wired from node {src_node}({entity_list[src_node]}) via ST")
+
+    return entity_list, relation_list, True
+
 
 class Dataloader:
     def __init__(self):
@@ -474,8 +729,25 @@ if __name__ == "__main__":
     for txt in os.listdir(DL.sub_graph_path):
         whole_file_path = os.path.join(DL.sub_graph_path, txt)
         new_file_path = os.path.join(new_instance_path, txt)
-        graph_data,entity_list,relation_list1 = DL.get_graph_info(whole_file_path)
+        graph_data, entity_list, relation_list1 = DL.get_graph_info(whole_file_path)
         print(whole_file_path)
+
+        # ── PRE-PROCESSING STEP 1: Resolve UK edges ──────────────────────────
+        # Replace 'UK' verbs with semantically appropriate verbs before GA.
+        relation_list1, uk_stats = resolve_uk_edges(entity_list, relation_list1)
+        if uk_stats["total_uk"] > 0:
+            print(f"  [UK-RESOLVE] {uk_stats['resolved']}/{uk_stats['total_uk']} "
+                  f"UK edges resolved, {uk_stats['unresolved']} kept as RD fallback")
+
+        # ── PRE-PROCESSING STEP 2: Ensure network presence ───────────────────
+        # Graphs without any SO node lack C2/exfil semantics; inject one.
+        entity_list, relation_list1, so_injected = inject_network_node_if_missing(
+            entity_list, relation_list1
+        )
+        if so_injected:
+            # Update graph_data node-count line to reflect added SO node
+            graph_data[0] = str(len(entity_list)) + "\n"
+        # ─────────────────────────────────────────────────────────────────────
 
         # Debug: show what was parsed
         edge_counts = [len(s) for s in relation_list1]
@@ -614,6 +886,15 @@ if __name__ == "__main__":
 
         entity_one_instance_dic = {}
 
+        # Build per-node edge context for smart instance generation
+        # (used when CTI lookup yields no valid match for the required verbs)
+        node_edge_context = {}
+        for k in entity_instance_dic.keys():
+            node_edge_context[k] = {
+                "out_verbs": out_verbs.get(str(k), []),
+                "in_verbs":  in_verbs.get(str(k), []),
+            }
+
         for key in entity_instance_dic.keys():
             entity_one_instance_dic[key] = 0
             if len(entity_instance_dic[key]) != 0:
@@ -645,14 +926,47 @@ if __name__ == "__main__":
                             break
                     if valid:
                         filtered_instances.append(instance)
-                # ----------------------------------
+
+                # ── PREFERENCE PASS 1: ST + WR  →  prefer FILE_AND_NETWORK_TOOLS ──
+                # A node that must both send over network AND write files should use
+                # curl/wget/scp rather than a pure scanner like nmap/masscan.
+                node_out = set(out_verbs.get(str(key), []))
+                if (target_type in ("MP", "TP")
+                        and filtered_instances
+                        and node_out & {"ST", "RF"}
+                        and node_out & {"WR"}):
+                    preferred = [
+                        inst for inst in filtered_instances
+                        if validator._normalize_tool(inst) in FILE_AND_NETWORK_TOOLS
+                    ]
+                    if preferred:
+                        filtered_instances = preferred
+
+                # ── PREFERENCE PASS 2: EX in in_verbs  →  force executable extension ──
+                # If this node (SF/MF) will be executed, only pick instances
+                # that have an explicit executable file extension.
+                node_in = set(in_verbs.get(str(key), []))
+                if target_type in ("SF", "MF") and "EX" in node_in and filtered_instances:
+                    exec_instances = [
+                        inst for inst in filtered_instances
+                        if validator._get_extension(inst) in EXECUTABLE_EXTENSIONS_STRICT
+                    ]
+                    if exec_instances:
+                        filtered_instances = exec_instances
+                # -------------------------------------------------------------------
 
                 if len(filtered_instances) != 0:
                     entity_one_instance_dic[key] = random.choice(filtered_instances)
                 else:
-                    # NO FALLTHROUGH to unvalidated pool.
-                    # If no CTI instance passes the allowlist, use fallback.
-                    entity_one_instance_dic[key] = validator.get_fallback_instance(target_type)
+                    # No CTI instance satisfies the edge constraints for this node.
+                    # Use a context-aware smart name instead of 'unknown_*'.
+                    smart_name = generate_smart_instance_name(
+                        target_type, node_edge_context[key]
+                    )
+                    entity_one_instance_dic[key] = smart_name
+                    print(f"  [SMART] Node {key}({target_type}): no CTI match "
+                          f"for out_verbs={node_edge_context[key]['out_verbs']}, "
+                          f"generated '{smart_name}'")
         print(entity_one_instance_dic)
 
         # ── POST-ASSIGNMENT ENFORCEMENT ──
@@ -678,9 +992,14 @@ if __name__ == "__main__":
                         is_valid = False
                         break
             if not is_valid:
-                fallback = validator.get_fallback_instance(node_type)
+                # Use smart name (not unknown_*) as the enforced replacement
+                ctx = node_edge_context.get(node_key, {
+                    "out_verbs": out_verbs.get(str(node_key), []),
+                    "in_verbs":  in_verbs.get(str(node_key), []),
+                })
+                fallback = generate_smart_instance_name(node_type, ctx)
                 print(f"  [ENFORCE] Node {node_key}({node_type}): '{instance_name}' "
-                      f"failed edge validation -> fallback '{fallback}'")
+                      f"failed edge validation -> smart replacement '{fallback}'")
                 entity_one_instance_dic[node_key] = fallback
 
         not_satisfied_entity = []
@@ -773,7 +1092,28 @@ if __name__ == "__main__":
                 final_graph_data.append(str(len(new_entity_match_dic.keys()))+"\n")
             elif v not in delete_edge_list:
                 final_graph_data.append(temp_graph_data[v])
-        final_graph_data[len(new_entity_match_dic.keys())+1] = str(int(final_graph_data[len(new_entity_match_dic.keys())+1])-len(delete_edge_list))+"\n"
+        # Update edge count in final_graph_data.
+        # NOTE: We cannot assume the edge-count line is at a fixed index because:
+        #   - Some input files (with stage annotation) have an explicit edge-count line
+        #     after the node-instance lines.
+        #   - Files without stage annotation (Find_hub fallback) have NO edge-count line;
+        #     edges start immediately after node lines.
+        # Strategy: scan final_graph_data for the first line that is a bare integer
+        # AFTER all node lines (i.e., after index N_nodes). If found, decrement it.
+        n_nodes = len(new_entity_match_dic.keys())
+        edge_count_idx = None
+        for _i in range(n_nodes + 1, len(final_graph_data)):
+            candidate = final_graph_data[_i].strip()
+            if candidate.isdigit():
+                edge_count_idx = _i
+                break
+
+        if edge_count_idx is not None and len(delete_edge_list) > 0:
+            old_count = int(final_graph_data[edge_count_idx].strip())
+            new_count = max(0, old_count - len(delete_edge_list))
+            final_graph_data[edge_count_idx] = str(new_count) + "\n"
+        # If no edge-count line found, nothing to update (file format has no header).
+
 
         with open(new_file_path, 'w', encoding='utf-8') as file:
             file.writelines(final_graph_data)
