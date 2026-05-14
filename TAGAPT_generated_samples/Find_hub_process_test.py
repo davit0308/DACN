@@ -990,8 +990,8 @@ def make_relation_type(relation_list):
     return relation_type_dic
 
 if __name__ == '__main__':
-    graph_txt_path = r".\graph_txt" #input
-    graph_txt_path_2 = r".\graph_txt_sub" #output
+    graph_txt_path   = os.path.join(".", "graph_txt")    # input  (cross-platform)
+    graph_txt_path_2 = os.path.join(".", "graph_txt_sub") # output (cross-platform)
     num2bond = {0: "RD", 1: "WR", 2: "EX", 3: "UK", 4: "CD", 5: "FR", 6: "IJ", 7: "ST", 8: "RF", 9: "none"}
     values = np.arange(54, 55, 2)
     y1 = []

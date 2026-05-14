@@ -269,18 +269,30 @@ if not subgraph_ready and not graph_txt_ready:
 if graph_txt_ready and not subgraph_ready:
     print("\n[INFO] Chay Find_hub_process_test.py de gan stage annotation...")
 
-    # Find_hub doc tu ./graph_txt, ghi ra ./graph_txt_sub
-    graph_txt_sub = os.path.join(working_dir, "graph_txt_sub")
-    if os.path.exists(graph_txt_sub):
-        shutil.rmtree(graph_txt_sub)
-    os.makedirs(graph_txt_sub)
+    # Find_hub hardcodes r".\graph_txt" and r".\graph_txt_sub" as relative paths.
+    # Fix: run it with cwd=working_dir AND ensure graph_txt/ exists there with the right name.
+    # If graph_txt_dir is not already named "graph_txt" inside working_dir, create a symlink/copy.
+    expected_input  = os.path.join(working_dir, "graph_txt")
+    expected_output = os.path.join(working_dir, "graph_txt_sub")
+
+    # Make sure Find_hub can find its input as "./graph_txt"
+    if os.path.abspath(graph_txt_dir) != os.path.abspath(expected_input):
+        if os.path.exists(expected_input):
+            shutil.rmtree(expected_input)
+        shutil.copytree(graph_txt_dir, expected_input)
+
+    # Pre-create output dir
+    if os.path.exists(expected_output):
+        shutil.rmtree(expected_output)
+    os.makedirs(expected_output)
 
     hub_result = subprocess.run(
         ["python", "Find_hub_process_test.py"],
-        cwd=working_dir,
+        cwd=working_dir,   # ← Find_hub reads from ./graph_txt relative to this cwd
         capture_output=True,
         text=True,
         timeout=300,
+
     )
 
     print(f"  Find_hub return code: {hub_result.returncode}")
@@ -304,8 +316,8 @@ if graph_txt_ready and not subgraph_ready:
         if os.path.exists(sub_graph_dir):
             shutil.rmtree(sub_graph_dir)
 
-        if os.path.exists(graph_txt_sub) and os.listdir(graph_txt_sub):
-            shutil.copytree(graph_txt_sub, sub_graph_dir)
+        if os.path.exists(expected_output) and os.listdir(expected_output):
+            shutil.copytree(expected_output, sub_graph_dir)
         else:
             print("[WARN] graph_txt_sub/ rong, dung graph_txt/ truc tiep")
             shutil.copytree(graph_txt_dir, sub_graph_dir)
